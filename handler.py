@@ -74,8 +74,19 @@ DEFAULT_SYSTEM_PROMPT = (
     "Answer questions or provide advice in a clear and engaging way."
 )
 
-HF_CACHE_SEARCH_BASES = ["/runpod-volume", "/workspace", os.path.expanduser("~/.cache")]
-HF_DIR_NAMES = ["huggingface", "huggingface-cache", ".cache/huggingface"]
+# RunPod Serverless standard cache location (checked FIRST)
+RUNPOD_HF_CACHE = "/runpod-volume/huggingface-cache"
+
+HF_CACHE_SEARCH_BASES = [
+    "/runpod-volume",  # RunPod network volume
+    "/workspace",      # Alternative workspace
+    os.path.expanduser("~/.cache"),  # User cache fallback
+]
+HF_DIR_NAMES = [
+    "huggingface-cache",  # RunPod standard: /runpod-volume/huggingface-cache
+    "huggingface",        # Standard HF cache
+    ".cache/huggingface", # User cache
+]
 
 MODEL_DIR_CANDIDATES = [
     "/runpod-volume/models",
@@ -99,9 +110,13 @@ def discover_hf_cache(hf_repo: str = DEFAULT_REPO) -> Optional[str]:
     """
     Return an HF_HOME path.  Priority:
       1. HF_HOME env var (if the dir exists)
-      2. A directory that already contains the cached model
-      3. A writable persistent directory (so future runs benefit)
+      2. RunPod Serverless standard cache: /runpod-volume/huggingface-cache
+      3. A directory that already contains the cached model
+      4. A writable persistent directory (so future runs benefit)
+    
+    Returns the parent directory (HF_HOME), not the hub subdirectory.
     """
+    # 1. Check explicit HF_HOME env var
     env_home = os.environ.get("HF_HOME")
     if env_home and os.path.isdir(env_home):
         logger.info(f"HF_HOME from env: {env_home}")
@@ -109,31 +124,65 @@ def discover_hf_cache(hf_repo: str = DEFAULT_REPO) -> Optional[str]:
 
     model_subpath = os.path.join("hub", f"models--{hf_repo.replace('/', '--')}")
 
+    # 2. Check RunPod Serverless standard cache location FIRST
+    if os.path.isdir(RUNPOD_HF_CACHE):
+        hub_path = os.path.join(RUNPOD_HF_CACHE, "hub")
+        if os.path.isdir(os.path.join(hub_path, model_subpath)):
+            logger.info(f"✅ Found RunPod cached model at {RUNPOD_HF_CACHE}")
+            return RUNPOD_HF_CACHE
+        elif os.path.isdir(hub_path):
+            logger.info(f"✅ Using RunPod cache directory: {RUNPOD_HF_CACHE}")
+            return RUNPOD_HF_CACHE
+
+    # 3. Search other locations for cached model
     for base in HF_CACHE_SEARCH_BASES:
         if not os.path.isdir(base):
             continue
         for hf_dir in HF_DIR_NAMES:
             candidate = os.path.join(base, hf_dir)
-            if os.path.isdir(os.path.join(candidate, model_subpath)):
-                logger.info(f"Cached model found under {candidate}")
+            hub_candidate = os.path.join(candidate, "hub")
+            if os.path.isdir(os.path.join(hub_candidate, model_subpath)):
+                logger.info(f"✅ Found cached model at {candidate}")
+                return candidate
+            elif os.path.isdir(hub_candidate):
+                logger.info(f"✅ Using cache directory: {candidate}")
                 return candidate
 
+    # 4. Fallback: create writable cache directory
     for base in HF_CACHE_SEARCH_BASES:
         if os.path.isdir(base) and os.access(base, os.W_OK):
-            fallback = os.path.join(base, "huggingface")
+            fallback = os.path.join(base, "huggingface-cache")
             os.makedirs(fallback, exist_ok=True)
-            logger.info(f"Using {fallback} as HF_HOME (model will be downloaded)")
+            logger.info(f"⚠️  Using fallback cache: {fallback} (model will be downloaded)")
             return fallback
 
+    logger.warning("No HF cache directory found, moshi will download model")
     return None
 
 
 def is_model_cached(hf_home: str, hf_repo: str = DEFAULT_REPO) -> bool:
-    """Check whether the model snapshots directory is populated."""
-    snaps = os.path.join(
-        hf_home, "hub", f"models--{hf_repo.replace('/', '--')}", "snapshots"
-    )
-    return os.path.isdir(snaps) and bool(os.listdir(snaps))
+    """
+    Check whether the model snapshots directory is populated.
+    
+    RunPod structure: /runpod-volume/huggingface-cache/hub/models--nvidia--personaplex-7b-v1/snapshots/{hash}
+    """
+    hub_dir = os.path.join(hf_home, "hub")
+    model_dir = os.path.join(hub_dir, f"models--{hf_repo.replace('/', '--')}")
+    snaps_dir = os.path.join(model_dir, "snapshots")
+    
+    if not os.path.isdir(snaps_dir):
+        logger.debug(f"Snapshots dir not found: {snaps_dir}")
+        return False
+    
+    snapshots = [d for d in os.listdir(snaps_dir) if os.path.isdir(os.path.join(snaps_dir, d))]
+    cached = bool(snapshots)
+    
+    if cached:
+        logger.info(f"✅ Model cached: {len(snapshots)} snapshot(s) found in {snaps_dir}")
+    else:
+        logger.debug(f"⚠️  Snapshots dir empty: {snaps_dir}")
+    
+    return cached
 
 
 def discover_model_files() -> Dict[str, str]:
@@ -225,14 +274,34 @@ class PersonaplexSession:
     def start_moshi_server(self):
         env = os.environ.copy()
 
+        # Discover and configure HuggingFace cache location
         hf_cache = discover_hf_cache(self.hf_repo)
         if hf_cache:
+            # HF_HOME is the parent directory (e.g., /runpod-volume/huggingface-cache)
             env["HF_HOME"] = hf_cache
+            # HF_HUB_CACHE is where models are stored (e.g., /runpod-volume/huggingface-cache/hub)
             env["HF_HUB_CACHE"] = os.path.join(hf_cache, "hub")
+            # Also set TRANSFORMERS_CACHE for transformers library
+            env["TRANSFORMERS_CACHE"] = env["HF_HUB_CACHE"]
+            
+            logger.info(f"📦 HF_HOME={hf_cache}")
+            logger.info(f"📦 HF_HUB_CACHE={env['HF_HUB_CACHE']}")
+            
             if is_model_cached(hf_cache, self.hf_repo):
                 env["HF_HUB_OFFLINE"] = "1"
                 env["TRANSFORMERS_OFFLINE"] = "1"
-                logger.info("HF offline mode ON (model already cached)")
+                logger.info("✅ HF offline mode ON (model already cached)")
+            else:
+                logger.info("⚠️  Model not found in cache, will download (requires HF_TOKEN)")
+        else:
+            logger.warning("⚠️  No HF cache directory found, moshi will use default locations")
+        
+        # HF_TOKEN is optional if model is cached, but recommended for gated models
+        if not env.get("HF_TOKEN"):
+            logger.warning(
+                "HF_TOKEN not set. This is OK if RunPod cached the model, "
+                "but may cause issues with gated models or incomplete caches."
+            )
 
         model_files = discover_model_files()
 
